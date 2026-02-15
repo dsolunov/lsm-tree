@@ -43,9 +43,9 @@ private:
     } 
 };
 
-template <size_t BLOCK_SIZE, size_t R>
 class SSTable {
 private:
+    const size_t BLOCK_SIZE;
     std::string path;
     std::ifstream in;
 
@@ -53,15 +53,23 @@ private:
     BloomFilter<7, 1000000> bloom_filter;
 
 public:
-    SSTable(const std::string& path, const std::map<std::string, std::string>& data) :
+    SSTable(const size_t BLOCK_SIZE, const std::string& path, const std::map<std::string, std::string>& data) :
+        BLOCK_SIZE(BLOCK_SIZE),
         path(path),
         offsets(),
         bloom_filter() {
         std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        if (!out) {
+            throw std::runtime_error("bad path: " + path);
+        }
         int ind = 0;
         for (const auto& [key, value] : data) {
             if (ind % BLOCK_SIZE == 0) {
-                uint64_t offset = out.tellp();
+                auto res = out.tellp();
+                if (res == std::streampos(-1)) {
+                    throw std::runtime_error("tellp failed :(");
+                }
+                uint64_t offset = static_cast<uint64_t>(res);
                 offsets.emplace_back(key, offset);
             }
             out << key << '\n' << value << '\n';
@@ -70,22 +78,29 @@ public:
         }
         out.close();
         in = std::ifstream(path, std::ios::binary);
+        if (!in) {
+            throw std::runtime_error("bad path: " + path);
+        }
     }
 
-    ~SSTable() {
-        in.close();
-    }
-
-    SSTable(const std::string& path, std::array<SSTable, R>&& prev_level) :
+    SSTable(const size_t BLOCK_SIZE, const std::string& path, std::vector<SSTable>&& prev_level) :
+        BLOCK_SIZE(BLOCK_SIZE),
         path(path),
         offsets(),
         bloom_filter() {
+        size_t R = prev_level.size();
         std::ofstream out(path, std::ios::binary | std::ios::trunc);
-        std::array<bool, R> ended{};
-        std::array<std::pair<std::string, std::string>, R> cur_val;
-        std::array<std::ifstream, R> fin;
+        if (!out) {
+            throw std::runtime_error("bad path: " + path);
+        }
+        std::vector<bool> ended(R, false);
+        std::vector<std::pair<std::string, std::string>> cur_val(R);
+        std::vector<std::ifstream> fin(R);
         for (size_t i = 0; i < R; i++) {
             fin[i].open(prev_level[i].path, std::ios::binary);
+            if (!fin[i]) {
+                throw std::runtime_error("bad path: " + prev_level[i].path);
+            }
         }
         for (size_t i = 0; i < R; i++) {
             if (!std::getline(fin[i], cur_val[i].first) || !std::getline(fin[i], cur_val[i].second)) {
@@ -113,7 +128,11 @@ public:
                 break;
             }
             if (ind % BLOCK_SIZE == 0) {
-                uint64_t offset = out.tellp();
+                auto res = out.tellp();
+                if (res == std::streampos(-1)) {
+                    throw std::runtime_error("tellp failed :(");
+                }
+                uint64_t offset = static_cast<uint64_t>(res);
                 offsets.emplace_back(mn.first, offset);
             }
             ind++;
@@ -129,24 +148,35 @@ public:
         }
         out.close();
         in = std::ifstream(path, std::ios::binary);
+        if (!in) {
+            throw std::runtime_error("bad path: " + path);
+        }
     }
 
     SSTable(const SSTable&) = delete;
     SSTable& operator=(const SSTable&) = delete;
     SSTable(SSTable&&) noexcept = default;
-    SSTable& operator=(SSTable&&) noexcept = default;
+    SSTable& operator=(SSTable&&) noexcept = delete;
 
     std::vector<std::pair<std::string, std::string>> ReadBlock(uint64_t offset) {
         in.clear();
         in.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
-        std::vector<std::pair<std::string, std::string>> data(BLOCK_SIZE);
+        std::vector<std::pair<std::string, std::string>> data;
+        data.reserve(BLOCK_SIZE);
         for (size_t i = 0; i < BLOCK_SIZE; i++) {
-            in >> data[i].first >> data[i].second;
+            std::pair<std::string, std::string> new_pair;
+            if (!std::getline(in, new_pair.first) || !std::getline(in, new_pair.second)) {
+                break;
+            }
+            data.push_back(new_pair);
         }
         return data;
     }
 
-    uint64_t GetOffset(const std::string& key) {
+    std::optional<uint64_t> GetOffset(const std::string& key) {
+        if (offsets.empty()) {
+            return std::nullopt;
+        }
         size_t l = 0;
         size_t r = offsets.size();
         while (r - l > 1) {
@@ -157,13 +187,23 @@ public:
                 l = mid;
             }
         }
-        return offsets[l].second;
+        return {offsets[l].second};
     }
 
-    std::string Get(const std::string& key) {
-        std::vector<std::pair<std::string, std::string>> block = ReadBlock(GetOffset(key));
+    std::optional<std::string> Get(const std::string& key) {
+        if (!bloom_filter.Contains(key)) {
+            return std::nullopt;
+        }
+        std::optional<uint64_t> offset = GetOffset(key);
+        if (!offset.has_value()) {
+            return std::nullopt;
+        }
+        std::vector<std::pair<std::string, std::string>> block = ReadBlock(offset.value());
+        if (block.empty()) {
+            return std::nullopt;
+        }
         size_t l = 0;
-        size_t r = BLOCK_SIZE;
+        size_t r = block.size();
         while (r - l > 1) {
             size_t mid = (l + r) / 2;
             if (key < block[mid].first) {
@@ -172,15 +212,107 @@ public:
                 l = mid;
             }
         }
-        return block[l].second;
+        if (block[l].first == key) {
+            return {block[l].second};
+        } else {
+            return std::nullopt;
+        }
     }
 };
 
-class LSMTree {
 
+class LSMTree {
+private:
+    const size_t C; // max size of the memtable
+    const size_t R; // max number of sstables on one level
+    const size_t BLOCK_SIZE;
+    std::map<std::string, std::string> memtable;
+    std::vector<std::vector<SSTable>> sstables;
+
+public:
+    LSMTree(const size_t C, const size_t R, const size_t BLOCK_SIZE) :
+        C(C),
+        R(R),
+        BLOCK_SIZE(BLOCK_SIZE) {}
+    
+    void Add(const std::string& key, const std::string& value) {
+        memtable[key] = value;
+        if (memtable.size() >= C) {
+            if (sstables.empty()) {
+                sstables.emplace_back();
+            }
+            sstables[0].emplace_back(BLOCK_SIZE, "./0_" + std::to_string(sstables[0].size()) + ".txt", memtable);
+            size_t level = 0;
+            while (sstables[level].size() >= R) {
+                if (sstables.size() <= level + 1) {
+                    sstables.emplace_back();
+                }
+                std::string path = "./" + std::to_string(level + 1) + "_" + std::to_string(sstables[level + 1].size()) + ".txt";
+                sstables[level + 1].emplace_back(BLOCK_SIZE, path, std::move(sstables[level]));
+                sstables[level].clear();
+                level++;
+            }
+            memtable.clear();
+        }
+    }
+
+    std::optional<std::string> Get(const std::string& key) {
+        auto it = memtable.find(key);
+        if (it != memtable.end()) {
+            return it->second;
+        }
+        for (size_t level = 0; level < sstables.size(); level++) {
+            for (size_t ind = sstables[level].size(); ind-- > 0;) {
+                std::optional<std::string> res = sstables[level][ind].Get(key);
+                if (res.has_value()) {
+                    return res;
+                }
+            }
+        }
+        return std::nullopt;
+    }
 };
+
+std::mt19937 rnd(97);
+
+std::string GenString(size_t length) {
+    std::string s;
+    for (size_t i = 0; i < length; i++) {
+        s.push_back('a' + rnd() % 26);
+    }
+    return s;
+}
 
 
 int main() {
+    LSMTree lsm(100, 3, 50);
+    std::mt19937 rnd(97);
 
+    const size_t STRING_LENGTH = 10;
+    std::vector<std::pair<std::string, std::string>> queries;
+    for (size_t i = 0; i < 10000; i++) {
+        queries.emplace_back(GenString(STRING_LENGTH), GenString(STRING_LENGTH));
+    }
+    for (size_t i = 0; i < 1000; i++) {
+        lsm.Add(queries[i].first, queries[i].second);
+    }
+    for (size_t i = 0; i < 1000; i++) {
+        auto res = lsm.Get(queries[i].first);
+        if (!res.has_value() && res.value() != queries[i].second) {
+            std::cout << "NOOOOO... -- 1000 add + 1000 get" << std::endl;
+        }
+    }
+    for (int i = 1000; i < 2000; i++) {
+        if (lsm.Get(queries[i].first).has_value()) {
+            std::cout << "NOOOOO... -- get non-existed key" << std::endl;
+        }
+    }
+    for (int i = 1000; i < 2000; i++) {
+        lsm.Add(queries[i].first, queries[i].second);
+        size_t query_ind = rnd() % (i + 1);
+        auto res = lsm.Get(queries[query_ind].first);
+        if (!res.has_value() && res.value() != queries[query_ind].second) {
+            std::cout << "NOOOOO... -- add + random get" << std::endl;
+        }
+    }
 }
