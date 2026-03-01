@@ -1,18 +1,24 @@
 #include <bits/stdc++.h>
+#include <roaring/roaring.hh>
 
-void PrintSet(const std::set<uint32_t>& output_set) {
-    std::cout << "{";
-    size_t cnt = 0;
-    for (uint32_t elem : output_set) {
-        std::cout << elem;
-        if (++cnt != output_set.size()) {
-            std::cout << ", ";
+std::string RoaringBitmapToString(const roaring::Roaring& bitmap) {
+    std::string res;
+    bool first = true;
+    for (uint32_t x : bitmap) {
+        if (!first) {
+            res += " ";
         }
+        first = false;
+        res += std::to_string(x);
     }
-    std::cout << '}' << std::endl;
+    return res;
 }
 
-bool IsBlankSymbol(unsigned char c) {
+bool IsFormulaBlankSymbol(unsigned char c) {
+    return c == ' ' || c == '\n' || c == '\t';
+}
+
+bool IsSeparator(unsigned char c) {
     return c == ' ' || c == '\n' || c == '\t' || c == '.' || c == ',' || c == ';' || c == ':';
 }
 
@@ -22,7 +28,7 @@ public:
         std::vector<std::string> tokens;
         std::string current_token;
         for (unsigned char c : document) {
-            if (IsBlankSymbol(c)) {
+            if (IsSeparator(c)) {
                 if (!current_token.empty()) {
                     tokens.push_back(current_token);
                     current_token.clear();
@@ -41,7 +47,11 @@ public:
 class TokenNormalizer {
 public:
     std::string operator()(const std::string& token) {
-        return token;
+        std::string res_token = token;
+        for (char& c : res_token) {
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        }
+        return res_token;
     }
 
     std::vector<std::string> operator()(const std::vector<std::string>& tokens) {
@@ -73,14 +83,14 @@ private:
 
 public:
     QueryCalculator(InvertedIndex& index) : index(index), formula(), pos(0) {}
-    std::set<uint32_t> operator()(const std::string& formula);
+    roaring::Roaring operator()(const std::string& formula);
 
 private:
     QueryToken GetToken();
-    std::set<uint32_t> CalcOR();
-    std::set<uint32_t> CalcAND();
-    std::set<uint32_t> CalcNOT();
-    std::set<uint32_t> CalcBRACKET();
+    roaring::Roaring CalcOR();
+    roaring::Roaring CalcAND();
+    roaring::Roaring CalcNOT();
+    roaring::Roaring CalcBRACKET();
 
     static bool IsSpecialFormulaSymbol(unsigned char c) {
         return c == '(' || c == ')' || c == '&' || c == '|' || c == '!';
@@ -92,8 +102,8 @@ private:
     Tokenizer tokenizer;
     TokenNormalizer normalizer;
     QueryCalculator query_calc;
-    std::map<std::string, std::set<uint32_t>> index;
-    std::set<uint32_t> all_document_set;
+    std::map<std::string, roaring::Roaring> index;
+    roaring::Roaring all_document_set;
 
 public:
     InvertedIndex() : tokenizer(), normalizer(), query_calc(*this), index(), all_document_set() {}
@@ -103,32 +113,32 @@ public:
         std::sort(tokens.begin(), tokens.end());
         tokens.erase(std::unique(tokens.begin(), tokens.end()), tokens.end());
         for (const std::string& token : tokens) {
-            index[token].insert(document_id);
+            index[token].add(document_id);
         }
-        all_document_set.insert(document_id);
+        all_document_set.add(document_id);
     }
 
-    std::set<uint32_t> SearchWord(const std::string& word) {
+    roaring::Roaring SearchWord(const std::string& word) {
         auto it = index.find(normalizer(word));
         if (it == index.end()) {
-            return {};
+            return roaring::Roaring{};
         }
         return it->second;
     }
 
-    std::set<uint32_t> SearchFormula(const std::string& formula) {
+    roaring::Roaring SearchFormula(const std::string& formula) {
         return query_calc(formula);
     }
 
-    const std::set<uint32_t>& GetAllDocumentSet() {
+    const roaring::Roaring& GetAllDocumentSet() const {
         return all_document_set;
     }
 };
 
-std::set<uint32_t> QueryCalculator::operator()(const std::string& formula) {
+roaring::Roaring QueryCalculator::operator()(const std::string& formula) {
     this->formula = formula;
     pos = 0;
-    std::set<uint32_t> res = CalcOR();
+    roaring::Roaring res = CalcOR();
     if (GetToken().type == QueryTokenType::END) {
         return res;
     }
@@ -136,7 +146,7 @@ std::set<uint32_t> QueryCalculator::operator()(const std::string& formula) {
 }
 
 QueryToken QueryCalculator::GetToken() {
-    while (pos < formula.size() && IsBlankSymbol(formula[pos])) {
+    while (pos < formula.size() && IsFormulaBlankSymbol(formula[pos])) {
         pos++;
     }
     if (pos == formula.size()) {
@@ -159,7 +169,7 @@ QueryToken QueryCalculator::GetToken() {
         return {QueryTokenType::NOT, ""};
     } else {
         std::string word;
-        while (pos < formula.size() && !IsBlankSymbol(formula[pos]) && !IsSpecialFormulaSymbol(formula[pos])) {
+        while (pos < formula.size() && !IsFormulaBlankSymbol(formula[pos]) && !IsSpecialFormulaSymbol(formula[pos])) {
             word += formula[pos];
             pos++;
         }
@@ -167,64 +177,46 @@ QueryToken QueryCalculator::GetToken() {
     }
 }
 
-std::set<uint32_t> QueryCalculator::CalcOR() {
-    std::set<uint32_t> res = CalcAND();
+roaring::Roaring QueryCalculator::CalcOR() {
+    roaring::Roaring res = CalcAND();
     size_t start_pos = pos;
     while (GetToken().type == QueryTokenType::OR) {
-        std::set<uint32_t> operand = CalcAND();
-        std::set<uint32_t> union_set;
-        std::set_union(
-            res.begin(), res.end(), 
-            operand.begin(), operand.end(), 
-            std::inserter(union_set, union_set.begin())
-        );
-        res = union_set;
+        roaring::Roaring operand = CalcAND();
+        res |= operand;
         start_pos = pos;
     }
     pos = start_pos;
     return res;
 }
 
-std::set<uint32_t> QueryCalculator::CalcAND() {
-    std::set<uint32_t> res = CalcNOT();
+roaring::Roaring QueryCalculator::CalcAND() {
+    roaring::Roaring res = CalcNOT();
     size_t start_pos = pos;
     while (GetToken().type == QueryTokenType::AND) {
-        std::set<uint32_t> operand = CalcNOT();
-        std::set<uint32_t> intersection_set;
-        std::set_intersection(
-            res.begin(), res.end(), 
-            operand.begin(), operand.end(), 
-            std::inserter(intersection_set, intersection_set.begin())
-        );
-        res = intersection_set;
+        roaring::Roaring operand = CalcNOT();
+        res &= operand;
         start_pos = pos;
     }
     pos = start_pos;
     return res;
 }
 
-std::set<uint32_t> QueryCalculator::CalcNOT() {
+roaring::Roaring QueryCalculator::CalcNOT() {
     size_t start_pos = pos;
     QueryToken token = GetToken();
     if (token.type == QueryTokenType::NOT) {
-        const std::set<uint32_t>& all_document_set = index.GetAllDocumentSet();
-        std::set<uint32_t> res = CalcNOT();
-        std::set<uint32_t> difference_set;
-        std::set_difference(
-            all_document_set.begin(), all_document_set.end(),
-            res.begin(), res.end(),
-            std::inserter(difference_set, difference_set.begin())
-        );
-        return difference_set;
+        const roaring::Roaring& all_document_set = index.GetAllDocumentSet();
+        roaring::Roaring res = CalcNOT();
+        return all_document_set - res;
     }
     pos = start_pos;
     return CalcBRACKET();
 }
 
-std::set<uint32_t> QueryCalculator::CalcBRACKET() {
+roaring::Roaring QueryCalculator::CalcBRACKET() {
     QueryToken token = GetToken();
     if (token.type == QueryTokenType::LBRACKET) {
-        std::set<uint32_t> res = CalcOR();
+        roaring::Roaring res = CalcOR();
         if (GetToken().type != QueryTokenType::RBRACKET) {
             throw std::runtime_error("bad formula: no )");
         }
@@ -240,8 +232,8 @@ int main() {
     InvertedIndex index{};
     index.AddDocument(0, "aaa aaa bbb");
     index.AddDocument(1, "aaa a aa b");
-    PrintSet(index.SearchWord("aaa"));
-    PrintSet(index.SearchFormula("aaa & bbb"));
-    PrintSet(index.SearchFormula("(a | bbb) & !c & (aa | bbb)"));
-    PrintSet(index.SearchFormula("(a | bbb) & !c & (aa | bbb) & (w | ww | www | !aaa)"));
+    std::cout << RoaringBitmapToString(index.SearchWord("aaa")) << std::endl;;
+    std::cout << RoaringBitmapToString(index.SearchFormula("aaa & bbb")) << std::endl;
+    std::cout << RoaringBitmapToString(index.SearchFormula("(a | bbb) & !c & (aa | bbb)")) << std::endl;;
+    std::cout << RoaringBitmapToString(index.SearchFormula("(a | bbb) & !c & (aa | bbb) & (w | ww | www | !aaa)")) << std::endl;
 }
