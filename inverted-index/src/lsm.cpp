@@ -1,4 +1,8 @@
 #include "lsm.h"
+#include <filesystem>
+#include <roaring/roaring.hh>
+#include <sstream>
+#include <string>
 
 template <uint64_t K, size_t N>
 BloomFilter<K, N>::BloomFilter() : arr(0) {}
@@ -40,7 +44,7 @@ uint64_t BloomFilter<K, N>::prng(uint64_t& state) {
     return z ^ (z >> 31);
 }
 
-SSTable::SSTable(const size_t BLOCK_SIZE, const std::string& path, const std::map<std::string, std::string>& data)
+SSTable::SSTable(const size_t BLOCK_SIZE, const std::string& path, const std::map<std::string, roaring::Roaring>& data)
     : BLOCK_SIZE(BLOCK_SIZE), path(path), offsets(), bloom_filter() {
     std::ofstream out(path, std::ios::binary | std::ios::trunc);
     if (!out) {
@@ -56,7 +60,7 @@ SSTable::SSTable(const size_t BLOCK_SIZE, const std::string& path, const std::ma
             uint64_t offset = static_cast<uint64_t>(res);
             offsets.emplace_back(key, offset);
         }
-        out << key << '\n' << value << '\n';
+        out << key << '\n' << RoaringToString(value) << '\n';
         ind++;
         bloom_filter.Add(key);
     }
@@ -90,18 +94,15 @@ SSTable::SSTable(const size_t BLOCK_SIZE, const std::string& path, std::vector<S
     }
     size_t ind = 0;
     while (true) {
+        std::string min_key;
         bool first = true;
-        size_t mn_ind = 0;
-        std::pair<std::string, std::string> mn{};
-        for (size_t i = R; i-- > 0;) {
+        for (size_t i = 0; i < R; i++) {
             if (!ended[i]) {
                 if (first) {
-                    mn = cur_val[i];
-                    mn_ind = i;
+                    min_key = cur_val[i].first;
                     first = false;
-                } else if (cur_val[i].first < mn.first) {
-                    mn = cur_val[i];
-                    mn_ind = i;
+                } else if (cur_val[i].first < min_key) {
+                    min_key = cur_val[i].first;
                 }
             }
         }
@@ -114,18 +115,21 @@ SSTable::SSTable(const size_t BLOCK_SIZE, const std::string& path, std::vector<S
                 throw std::runtime_error("tellp failed :(");
             }
             uint64_t offset = static_cast<uint64_t>(res);
-            offsets.emplace_back(mn.first, offset);
+            offsets.emplace_back(min_key, offset);
         }
         ind++;
-        out << mn.first << '\n' << mn.second << '\n';
-        bloom_filter.Add(mn.first);
+        out << min_key << '\n';
+        bloom_filter.Add(min_key);
+        roaring::Roaring merged_bitmap{};
         for (size_t i = 0; i < R; i++) {
-            while (!ended[i] && cur_val[i].first == mn.first) {
+            while (!ended[i] && cur_val[i].first == min_key) {
+                merged_bitmap |= StringToRoaring(cur_val[i].second);
                 if (!std::getline(fin[i], cur_val[i].first) || !std::getline(fin[i], cur_val[i].second)) {
                     ended[i] = true;
                 }
             }
         }
+        out << RoaringToString(merged_bitmap) << '\n';
     }
     out.close();
     in = std::ifstream(path, std::ios::binary);
@@ -134,17 +138,17 @@ SSTable::SSTable(const size_t BLOCK_SIZE, const std::string& path, std::vector<S
     }
 }
 
-std::vector<std::pair<std::string, std::string>> SSTable::ReadBlock(uint64_t offset) {
+std::vector<std::pair<std::string, roaring::Roaring>> SSTable::ReadBlock(uint64_t offset) {
     in.clear();
     in.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
-    std::vector<std::pair<std::string, std::string>> data;
+    std::vector<std::pair<std::string, roaring::Roaring>> data;
     data.reserve(BLOCK_SIZE);
     for (size_t i = 0; i < BLOCK_SIZE; i++) {
-        std::pair<std::string, std::string> new_pair;
-        if (!std::getline(in, new_pair.first) || !std::getline(in, new_pair.second)) {
+        std::string key, bitmap_str;
+        if (!std::getline(in, key) || !std::getline(in, bitmap_str)) {
             break;
         }
-        data.push_back(new_pair);
+        data.emplace_back(key, StringToRoaring(bitmap_str));
     }
     return data;
 }
@@ -166,17 +170,17 @@ std::optional<uint64_t> SSTable::GetOffset(const std::string& key) {
     return {offsets[l].second};
 }
 
-std::optional<std::string> SSTable::Get(const std::string& key) {
+roaring::Roaring SSTable::Get(const std::string& key) {
     if (!bloom_filter.Contains(key)) {
-        return std::nullopt;
+        return roaring::Roaring{};
     }
     std::optional<uint64_t> offset = GetOffset(key);
     if (!offset.has_value()) {
-        return std::nullopt;
+        return roaring::Roaring{};
     }
-    std::vector<std::pair<std::string, std::string>> block = ReadBlock(offset.value());
+    std::vector<std::pair<std::string, roaring::Roaring>> block = ReadBlock(offset.value());
     if (block.empty()) {
-        return std::nullopt;
+        return roaring::Roaring{};
     }
     size_t l = 0;
     size_t r = block.size();
@@ -191,26 +195,51 @@ std::optional<std::string> SSTable::Get(const std::string& key) {
     if (block[l].first == key) {
         return {block[l].second};
     } else {
-        return std::nullopt;
+        return roaring::Roaring{};
     }
 }
 
-LSMTree::LSMTree(const size_t C, const size_t R, const size_t BLOCK_SIZE) : C(C), R(R), BLOCK_SIZE(BLOCK_SIZE) {}
+roaring::Roaring SSTable::StringToRoaring(const std::string& bitmap_str) {
+    roaring::Roaring res{};
+    std::stringstream s(bitmap_str);
+    uint32_t x;
+    while (s >> x) {
+        res.add(x);
+    }
+    return res;
+}
 
-void LSMTree::Add(const std::string& key, const std::string& value) {
-    memtable[key] = value;
+std::string SSTable::RoaringToString(const roaring::Roaring& bitmap) {
+    std::string res;
+    bool first = true;
+    for (uint32_t x : bitmap) {
+        if (!first) {
+            res += ' ';
+        }
+        first = false;
+        res += std::to_string(x);
+    }
+    return res;
+}
+
+LSMTree::LSMTree(const size_t C, const size_t R, const size_t BLOCK_SIZE) : C(C), R(R), BLOCK_SIZE(BLOCK_SIZE) {
+    std::filesystem::create_directories("./lsm-data");
+}
+
+void LSMTree::Add(const std::string& key, uint32_t value) {
+    memtable[key].add(value);
     if (memtable.size() >= C) {
         if (sstables.empty()) {
             sstables.emplace_back();
         }
-        sstables[0].emplace_back(BLOCK_SIZE, "./0_" + std::to_string(sstables[0].size()) + ".txt", memtable);
+        sstables[0].emplace_back(BLOCK_SIZE, "./lsm-data/0_" + std::to_string(sstables[0].size()) + ".txt", memtable);
         size_t level = 0;
         while (sstables[level].size() >= R) {
             if (sstables.size() <= level + 1) {
                 sstables.emplace_back();
             }
             std::string path =
-                "./" + std::to_string(level + 1) + "_" + std::to_string(sstables[level + 1].size()) + ".txt";
+                "./lsm-data/" + std::to_string(level + 1) + "_" + std::to_string(sstables[level + 1].size()) + ".txt";
             sstables[level + 1].emplace_back(BLOCK_SIZE, path, std::move(sstables[level]));
             sstables[level].clear();
             level++;
@@ -219,18 +248,16 @@ void LSMTree::Add(const std::string& key, const std::string& value) {
     }
 }
 
-std::optional<std::string> LSMTree::Get(const std::string& key) {
+roaring::Roaring LSMTree::Get(const std::string& key) {
+    roaring::Roaring res{};
     auto it = memtable.find(key);
     if (it != memtable.end()) {
-        return it->second;
+        res = it->second;
     }
     for (size_t level = 0; level < sstables.size(); level++) {
         for (size_t ind = sstables[level].size(); ind-- > 0;) {
-            std::optional<std::string> res = sstables[level][ind].Get(key);
-            if (res.has_value()) {
-                return res;
-            }
+            res |= sstables[level][ind].Get(key);
         }
     }
-    return std::nullopt;
+    return res;
 }

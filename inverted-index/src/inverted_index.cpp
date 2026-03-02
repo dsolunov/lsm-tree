@@ -1,6 +1,5 @@
 #include <bits/stdc++.h>
 #include <roaring/roaring.hh>
-#include <unordered_set>
 #include <oleander/english_stem.h>
 #include <lsm.h>
 
@@ -127,18 +126,18 @@ private:
     Tokenizer tokenizer;
     TokenNormalizer normalizer;
     QueryCalculator query_calc;
-    std::map<std::string, roaring::Roaring> index;
+    LSMTree index;
     roaring::Roaring all_document_set;
 
 public:
-    InvertedIndex() : tokenizer(), normalizer(), query_calc(*this), index(), all_document_set() {}
+    InvertedIndex() : tokenizer(), normalizer(), query_calc(*this), index(10, 3, 5), all_document_set() {}
 
     void AddDocument(uint32_t document_id, const std::string& document) {
         std::vector<std::string> tokens = normalizer(tokenizer(document));
         std::sort(tokens.begin(), tokens.end());
         tokens.erase(std::unique(tokens.begin(), tokens.end()), tokens.end());
         for (const std::string& token : tokens) {
-            index[token].add(document_id);
+            index.Add(token, document_id);
         }
         all_document_set.add(document_id);
     }
@@ -148,11 +147,7 @@ public:
         if (normalized_token.empty()) {
             return roaring::Roaring{};
         }
-        auto it = index.find(normalized_token);
-        if (it == index.end()) {
-            return roaring::Roaring{};
-        }
-        return it->second;
+        return index.Get(normalized_token);
     }
 
     roaring::Roaring SearchFormula(const std::string& formula) {
@@ -259,9 +254,39 @@ roaring::Roaring QueryCalculator::CalcBRACKET() {
 
 int main() {
     {
+        std::cout << "TEST INVERTED INDEX 1" << std::endl;
         InvertedIndex index{};
         index.AddDocument(0, "mother father cow banana");
         index.AddDocument(1, "cow black daddy");
-        std::cout << RoaringBitmapToString(index.SearchFormula("(cow | daddy) & !horse & (black | mother) & (father | black | banana | !cow)")) << std::endl;
+        index.AddDocument(2, "and or to red green white run rabbit queue terms cow");
+        index.AddDocument(3, "water melon watermelon horse pig big rabbit frog dog cats runnners");
+        std::cout << RoaringBitmapToString(index.SearchFormula("((cow & cow & !water) | daddy) & !horse & (black | mother) & (father | black | green | !cow)")) << std::endl;
+    }
+    {
+        std::cout << "TEST INVERTED INDEX 2" << std::endl;
+        InvertedIndex index{};
+        index.AddDocument(0, "apple orange banana");
+        index.AddDocument(1, "banana apple");
+        index.AddDocument(2, "grape orange apple");
+        index.AddDocument(3, "mango banana orange");
+        std::cout << RoaringBitmapToString(index.SearchFormula("apple & !banana")) << std::endl;
+    }
+    {
+        std::cout << "TEST NORMALIZER" << std::endl;
+        TokenNormalizer normalizer;
+        const std::vector<std::string> words = {
+            "run",
+            "running",
+            "runnner",
+            "ran",
+            "cow",
+            "cows",
+            "cowboy",
+            "bad",
+            "worse"
+        };
+        for (const std::string& word : words) {
+            std::cout << word << ' ' << normalizer(word) << std::endl;
+        }
     }
 }
