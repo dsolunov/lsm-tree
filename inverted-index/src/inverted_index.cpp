@@ -1,24 +1,5 @@
 #include <bits/stdc++.h>
-#include <roaring/roaring.hh>
 #include <oleander/english_stem.h>
-#include <lsm.h>
-
-std::string RoaringBitmapToString(const roaring::Roaring& bitmap) {
-    std::string res;
-    bool first = true;
-    for (uint32_t x : bitmap) {
-        if (!first) {
-            res += " ";
-        }
-        first = false;
-        res += std::to_string(x);
-    }
-    return res;
-}
-
-bool IsFormulaBlankSymbol(unsigned char c) {
-    return c == ' ' || c == '\n' || c == '\t';
-}
 
 bool IsSeparator(unsigned char c) {
     return c == ' ' || c == '\n' || c == '\t' || c == '.' || c == ',' || c == ';' || c == ':';
@@ -26,7 +7,7 @@ bool IsSeparator(unsigned char c) {
 
 class Tokenizer {
 public:
-    std::vector<std::string> operator()(const std::string& document) {
+    std::vector<std::string> operator()(const std::string& document) const {
         std::vector<std::string> tokens;
         std::string current_token;
         for (unsigned char c : document) {
@@ -49,10 +30,6 @@ public:
 class TokenNormalizer {
 private:
     stemming::english_stem<> english_stemmer;
-    const std::unordered_set<std::string> stop_words = {
-        "a", "an", "the", "is", "are", "was", "were",
-        "in", "on", "at", "of", "for", "to", "by"
-    };
 
 public:
     std::string operator()(const std::string& token) {
@@ -68,9 +45,6 @@ public:
         std::string res_token;
         for (wchar_t wc : token_stemming) {
             res_token += static_cast<char>(wc);
-        }
-        if (stop_words.find(lower_token) != stop_words.end()) {
-            return "";
         }
         return res_token;
     }
@@ -88,205 +62,202 @@ public:
     }
 };
 
-enum class QueryTokenType {
-    WORD, AND, OR, NOT, LBRACKET, RBRACKET, END
-};
-
-struct QueryToken {
-    QueryTokenType type;
-    std::string word;
-};
-
-class InvertedIndex;
-
-class QueryCalculator {
-private:
-    InvertedIndex& index;
-    std::string formula;
-    size_t pos;
-
-public:
-    QueryCalculator(InvertedIndex& index) : index(index), formula(), pos(0) {}
-    roaring::Roaring operator()(const std::string& formula);
-
-private:
-    QueryToken GetToken();
-    roaring::Roaring CalcOR();
-    roaring::Roaring CalcAND();
-    roaring::Roaring CalcNOT();
-    roaring::Roaring CalcBRACKET();
-
-    static bool IsSpecialFormulaSymbol(unsigned char c) {
-        return c == '(' || c == ')' || c == '&' || c == '|' || c == '!';
-    }
+struct PhraseSearchResult {
+    uint32_t document_id;
+    std::vector<uint32_t> start_positions;
 };
 
 class InvertedIndex {
+public:
+    using PostingList = std::map<uint32_t, std::vector<uint32_t>>;
+
 private:
     Tokenizer tokenizer;
     TokenNormalizer normalizer;
-    QueryCalculator query_calc;
-    LSMTree index;
-    roaring::Roaring all_document_set;
+    std::unordered_map<std::string, PostingList> index;
 
 public:
-    InvertedIndex() : tokenizer(), normalizer(), query_calc(*this), index(10, 3, 5), all_document_set() {}
+    InvertedIndex() = default;
+    ~InvertedIndex() = default;
 
     void AddDocument(uint32_t document_id, const std::string& document) {
         std::vector<std::string> tokens = normalizer(tokenizer(document));
-        std::sort(tokens.begin(), tokens.end());
-        tokens.erase(std::unique(tokens.begin(), tokens.end()), tokens.end());
-        for (const std::string& token : tokens) {
-            index.Add(token, document_id);
+        for (size_t i = 0; i < tokens.size(); i++) {
+            index[tokens[i]][document_id].push_back(i);
         }
-        all_document_set.add(document_id);
     }
 
-    roaring::Roaring SearchWord(const std::string& word) {
-        std::string normalized_token = normalizer(word);
-        if (normalized_token.empty()) {
-            return roaring::Roaring{};
+    std::vector<uint32_t> SearchWord(const std::string& word) {
+        std::string token = normalizer(word);
+        if (token.empty()) {
+            return {};
         }
-        return index.Get(normalized_token);
+        auto it = index.find(token);
+        if (it == index.end()) {
+            return {};
+        }
+        std::vector<uint32_t> res;
+        for (const auto& [document_id, positions] : it->second) {
+            res.push_back(document_id);
+        }
+        return res;
     }
 
-    roaring::Roaring SearchFormula(const std::string& formula) {
-        return query_calc(formula);
+    std::vector<PhraseSearchResult> SearchPhrase(const std::string& phrase) {
+        std::vector<PhraseSearchResult> res;
+        std::vector<std::string> tokens = normalizer(tokenizer(phrase));
+        if (tokens.empty()) {
+            return {};
+        }
+        std::vector<const PostingList*> postings(tokens.size());
+        for (size_t i = 0; i < tokens.size(); i++) {
+            auto it = index.find(tokens[i]);
+            if (it == index.end()) {
+                return {};
+            }
+            postings[i] = &it->second;
+        }
+        std::vector<PostingList::const_iterator> document_iterators(tokens.size());
+        bool finished = false;
+        for (size_t i = 0; i < tokens.size(); i++) {
+            document_iterators[i] = postings[i]->begin();
+            finished |= document_iterators[i] == postings[i]->end();
+        }
+        while (!finished) {
+            uint32_t mx = 0;
+            for (size_t i = 0; i < tokens.size(); i++) {
+                if (document_iterators[i]->first > mx) {
+                    mx = document_iterators[i]->first;
+                }
+            }
+            bool is_mx = true;
+            for (size_t i = 0; i < tokens.size(); i++) {
+                while (document_iterators[i] != postings[i]->end() && document_iterators[i]->first < mx) {
+                    document_iterators[i]++;
+                }
+                if (document_iterators[i] == postings[i]->end()) {
+                    finished = true;
+                    break;
+                }
+                is_mx &= document_iterators[i] != postings[i]->end() && document_iterators[i]->first == mx;
+            }
+            if (finished) {
+                break;
+            }
+            if (!is_mx) {
+                continue;
+            }
+            PhraseSearchResult document_res = SearchInDocument(mx, tokens);
+            if (!document_res.start_positions.empty()) {
+                res.push_back(document_res);
+            }
+            for (size_t i = 0; i < tokens.size(); i++) {
+                document_iterators[i]++;
+                if (document_iterators[i] == postings[i]->end()) {
+                    finished = true;
+                    break;
+                }
+            }
+        }
+        return res;
     }
 
-    const roaring::Roaring& GetAllDocumentSet() const {
-        return all_document_set;
+private:
+    PhraseSearchResult SearchInDocument(uint32_t document_id, const std::vector<std::string>& tokens) {
+        PhraseSearchResult res{document_id, {}};
+        std::vector<const std::vector<uint32_t>*> positions(tokens.size());
+        for (size_t i = 0; i < tokens.size(); i++) {
+            auto term_it = index.find(tokens[i]);
+            if (term_it == index.end()) {
+                return res;
+            }
+            auto doc_it = term_it->second.find(document_id);
+            if (doc_it == term_it->second.end()) {
+                return res;
+            }
+            if (doc_it->second.empty()) {
+                return res;
+            }
+            positions[i] = &doc_it->second;
+        }
+        std::vector<uint32_t> ind(tokens.size());
+        bool finished = false;
+        while (!finished) {
+            uint32_t mx = 0;
+            for (size_t i = 0; i < tokens.size(); i++) {
+                if ((*positions[i])[ind[i]] + (tokens.size() - i - 1) > mx) {
+                    mx = (*positions[i])[ind[i]] + (tokens.size() - i - 1);
+                }
+            }
+            bool is_mx = true;
+            for (size_t i = 0; i < tokens.size(); i++) {
+                while (ind[i] < positions[i]->size() && (*positions[i])[ind[i]] + (tokens.size() - i - 1) < mx) {
+                    ind[i]++;
+                }
+                if (ind[i] == positions[i]->size()) {
+                    finished = true;
+                    break;
+                }
+                is_mx &= (*positions[i])[ind[i]] + (tokens.size() - i - 1) == mx;
+            }
+            if (finished) {
+                break;
+            }
+            if (!is_mx) {
+                continue;
+            }
+            if (mx + 1 >= tokens.size()) {
+                res.start_positions.push_back(mx - (tokens.size() - 1));
+            }
+            for (size_t i = 0; i < tokens.size(); i++) {
+                ind[i]++;
+                if (ind[i] == positions[i]->size()) {
+                    finished = true;
+                    break;
+                }
+            }
+        }
+        return res;
     }
 };
 
-roaring::Roaring QueryCalculator::operator()(const std::string& formula) {
-    this->formula = formula;
-    pos = 0;
-    roaring::Roaring res = CalcOR();
-    if (GetToken().type == QueryTokenType::END) {
-        return res;
-    }
-    throw std::runtime_error("bad formula");
-}
-
-QueryToken QueryCalculator::GetToken() {
-    while (pos < formula.size() && IsFormulaBlankSymbol(formula[pos])) {
-        pos++;
-    }
-    if (pos == formula.size()) {
-        return {QueryTokenType::END, ""};
-    }
-    if (formula[pos] == '(') {
-        pos++;
-        return {QueryTokenType::LBRACKET, ""};
-    } else if (formula[pos] == ')') {
-        pos++;
-        return {QueryTokenType::RBRACKET, ""};
-    } else if (formula[pos] == '&') {
-        pos++;
-        return {QueryTokenType::AND, ""};
-    } else if (formula[pos] == '|') {
-        pos++;
-        return {QueryTokenType::OR, ""};
-    } else if (formula[pos] == '!') {
-        pos++;
-        return {QueryTokenType::NOT, ""};
-    } else {
-        std::string word;
-        while (pos < formula.size() && !IsFormulaBlankSymbol(formula[pos]) && !IsSpecialFormulaSymbol(formula[pos])) {
-            word += formula[pos];
-            pos++;
+namespace io {
+    void PrintWordSearchResult(const std::vector<uint32_t>& documents) {
+        if (documents.empty()) {
+            std::cout << "not found" << std::endl;
+            return;
         }
-        return {QueryTokenType::WORD, word};
-    }
-}
-
-roaring::Roaring QueryCalculator::CalcOR() {
-    roaring::Roaring res = CalcAND();
-    size_t start_pos = pos;
-    while (GetToken().type == QueryTokenType::OR) {
-        roaring::Roaring operand = CalcAND();
-        res |= operand;
-        start_pos = pos;
-    }
-    pos = start_pos;
-    return res;
-}
-
-roaring::Roaring QueryCalculator::CalcAND() {
-    roaring::Roaring res = CalcNOT();
-    size_t start_pos = pos;
-    while (GetToken().type == QueryTokenType::AND) {
-        roaring::Roaring operand = CalcNOT();
-        res &= operand;
-        start_pos = pos;
-    }
-    pos = start_pos;
-    return res;
-}
-
-roaring::Roaring QueryCalculator::CalcNOT() {
-    size_t start_pos = pos;
-    QueryToken token = GetToken();
-    if (token.type == QueryTokenType::NOT) {
-        const roaring::Roaring& all_document_set = index.GetAllDocumentSet();
-        roaring::Roaring res = CalcNOT();
-        return all_document_set - res;
-    }
-    pos = start_pos;
-    return CalcBRACKET();
-}
-
-roaring::Roaring QueryCalculator::CalcBRACKET() {
-    QueryToken token = GetToken();
-    if (token.type == QueryTokenType::LBRACKET) {
-        roaring::Roaring res = CalcOR();
-        if (GetToken().type != QueryTokenType::RBRACKET) {
-            throw std::runtime_error("bad formula: no )");
+        for (uint32_t document_id : documents) {
+            std::cout << document_id << " ";
         }
-        return res;
+        std::cout << std::endl;
     }
-    if (token.type == QueryTokenType::WORD) {
-        return index.SearchWord(token.word);
+
+    void PrintPhraseSearchResult(const std::vector<PhraseSearchResult>& results) {
+        if (results.empty()) {
+            std::cout << "not found" << std::endl;
+            return;
+        }
+        for (const PhraseSearchResult& result : results) {
+            std::cout << "document_id =" << result.document_id << ",  start_positions = [";
+            for (size_t i = 0; i < result.start_positions.size(); i++) {
+                if (i > 0) {
+                    std::cout << ", ";
+                }
+                std::cout << result.start_positions[i];
+            }
+            std::cout << "]" << std::endl;
+        }
     }
-    throw std::runtime_error("bad formula");
-}
+};
 
 int main() {
-    {
-        std::cout << "TEST INVERTED INDEX 1" << std::endl;
-        InvertedIndex index{};
-        index.AddDocument(0, "mother father cow banana");
-        index.AddDocument(1, "cow black daddy");
-        index.AddDocument(2, "and or to red green white run rabbit queue terms cow");
-        index.AddDocument(3, "water melon watermelon horse pig big rabbit frog dog cats runnners");
-        std::cout << RoaringBitmapToString(index.SearchFormula("((cow & cow & !water) | daddy) & !horse & (black | mother) & (father | black | green | !cow)")) << std::endl;
-    }
-    {
-        std::cout << "TEST INVERTED INDEX 2" << std::endl;
-        InvertedIndex index{};
-        index.AddDocument(0, "apple orange banana");
-        index.AddDocument(1, "banana apple");
-        index.AddDocument(2, "grape orange apple");
-        index.AddDocument(3, "mango banana orange");
-        std::cout << RoaringBitmapToString(index.SearchFormula("apple & !banana")) << std::endl;
-    }
-    {
-        std::cout << "TEST NORMALIZER" << std::endl;
-        TokenNormalizer normalizer;
-        const std::vector<std::string> words = {
-            "run",
-            "running",
-            "runnner",
-            "ran",
-            "cow",
-            "cows",
-            "cowboy",
-            "bad",
-            "worse"
-        };
-        for (const std::string& word : words) {
-            std::cout << word << ' ' << normalizer(word) << std::endl;
-        }
-    }
+    InvertedIndex index;
+    index.AddDocument(0, "cow is very nice animal");
+    index.AddDocument(1, "cow eats banana");
+    index.AddDocument(2, "monkey eats banana");
+    index.AddDocument(3, "Does Cow Eat Bananas");
+    io::PrintWordSearchResult(index.SearchWord("cow"));
+    io::PrintPhraseSearchResult(index.SearchPhrase("cow eats"));
+    io::PrintPhraseSearchResult(index.SearchPhrase("eats banana"));
 }
