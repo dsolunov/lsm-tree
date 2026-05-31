@@ -239,7 +239,7 @@ namespace io {
             return;
         }
         for (const PhraseSearchResult& result : results) {
-            std::cout << "document_id =" << result.document_id << ",  start_positions = [";
+            std::cout << "document_id = " << result.document_id << ",  start_positions = [";
             for (size_t i = 0; i < result.start_positions.size(); i++) {
                 if (i > 0) {
                     std::cout << ", ";
@@ -257,7 +257,13 @@ int main() {
     index.AddDocument(1, "cow eats banana");
     index.AddDocument(2, "monkey eats banana");
     index.AddDocument(3, "Does Cow Eat Bananas");
+    index.AddDocument(4, "banana banana banana");
+    std::cout << "Search word: cow" << std::endl;
     io::PrintWordSearchResult(index.SearchWord("cow"));
+    std::cout << "Search phrase: cow eats" << std::endl;
     io::PrintPhraseSearchResult(index.SearchPhrase("cow eats"));
+    std::cout << "Search phrase: eats banana" << std::endl;
     io::PrintPhraseSearchResult(index.SearchPhrase("eats banana"));
+    std::cout << "Search phrase: banana banana" << std::endl;
+    io::PrintPhraseSearchResult(index.SearchPhrase("banana banana"));
 }
